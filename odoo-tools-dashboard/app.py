@@ -18,29 +18,37 @@ st.caption(
 )
 
 # ----------------- ODOO HELPERS (JSON-RPC) ----------------- #
+def call_jsonrpc(url: str, payload: dict) -> dict:
+    url = url.rstrip("/")
+    r = requests.post(f"{url}/jsonrpc", json=payload, timeout=60)
+    try:
+        res = r.json()
+    except Exception:
+        raise Exception(
+            f"Odoo response not JSON. Status={r.status_code}, "
+            f"Body start: {r.text[:200]!r}"
+        )
+    if "error" in res:
+        msg = res["error"].get("data", {}).get("message", str(res["error"]))
+        raise Exception(msg)
+    return res["result"]
+
+
 def odoo_login_full(url, db, user, key):
     """
     Returns (uid, rpc) where rpc(endpoint, method, *args) calls /jsonrpc.
     """
-    url = url.rstrip("/")
-
     def rpc(endpoint, method, *args):
         payload = {
             "jsonrpc": "2.0",
             "method": "call",
             "params": {"service": endpoint, "method": method, "args": list(args)},
         }
-        r = requests.post(f"{url}/jsonrpc", json=payload, timeout=60)
-        r.raise_for_status()
-        res = r.json()
-        if "error" in res:
-            msg = res["error"].get("data", {}).get("message", str(res["error"]))
-            raise Exception(msg)
-        return res["result"]
+        return call_jsonrpc(url, payload)
 
     uid = rpc("common", "authenticate", db, user, key, {})
     if not uid:
-        raise Exception("Login failed (uid=0)")
+        raise Exception("Login failed (uid=0) – DB / user / key check karo")
     return uid, rpc
 
 
@@ -74,8 +82,8 @@ def odoo_create(rpc, db, uid, key, model, vals):
 # ----------------- PDF → CODES ----------------- #
 def extract_codes_from_pdf(file) -> list[str]:
     """
-    Swag invoice style: [ABC123-1] etc.
-    Regex tum invoice ke pattern ke hisaab se change bhi kar sakte ho.
+    Invoice style: [ABC123-1] etc.
+    Regex ko zaroorat ho to change kar sakte ho.
     """
     text = ""
     with pdfplumber.open(file) as pdf:
@@ -155,7 +163,7 @@ with col_manual:
     )
     st.caption("PDF se aaye codes yahan edit/add/remove kar sakte ho.")
 
-# Helper: login both Odoo
+# ----------------- COMMON HELPERS ----------------- #
 def connect_both_odoo():
     if not all([url_a, db_a, user_a, key_a, url_b, db_b, user_b, key_b]):
         raise Exception("Odoo A & B dono ke login details complete karo.")
@@ -164,7 +172,6 @@ def connect_both_odoo():
     return (uid_a, rpc_a), (uid_b, rpc_b)
 
 
-# Helper: read product+template info from A/B for given codes
 def load_products_for_codes(rpc, db, uid, key, codes, extra_price_fields=None):
     fields_prod = [
         "id",
@@ -212,17 +219,15 @@ def load_products_for_codes(rpc, db, uid, key, codes, extra_price_fields=None):
     return map_prod, map_tmpl
 
 
-# Helper: get wanted price from source
 def get_source_price(prod, tmpl, price_field: str):
     if price_field == "x_swag_price":
         return (tmpl and tmpl.get("x_swag_price")) or prod.get("x_swag_price") or 0.0
-    # default compare_list_price
     return (tmpl and tmpl.get("compare_list_price")) or prod.get(
         "compare_list_price"
     ) or 0.0
 
 
-# -------- Mode 1: PREVIEW ONLY -------- #
+# ----------------- MODE 1: PREVIEW ONLY ----------------- #
 if mode == "🔎 Preview only":
     if st.button("🔍 Preview A vs B (no write)"):
         codes = [c.strip() for c in codes_text.split(",") if c.strip()]
@@ -251,7 +256,11 @@ if mode == "🔎 Preview only":
                         uid_a,
                         key_a,
                         codes_missing_b,
-                        extra_price_fields=["list_price", "compare_list_price", "x_swag_price"],
+                        extra_price_fields=[
+                            "list_price",
+                            "compare_list_price",
+                            "x_swag_price",
+                        ],
                     )
                 )
 
@@ -329,7 +338,8 @@ if mode == "🔎 Preview only":
             except Exception as e:
                 st.error(f"❌ Error: {e}")
 
-# -------- Mode 2: SINGLE TEST CREATE -------- #
+
+# ----------------- MODE 2: SINGLE TEST CREATE ----------------- #
 if mode == "🧪 Single test create":
     st.markdown("### 🧪 Single product test create")
     test_code = st.text_input("Test model code (default_code)")
@@ -347,7 +357,10 @@ if mode == "🧪 Single test create":
                         rpc_b, db_b, uid_b, key_b, [code], extra_price_fields=[]
                     )
                     if code in map_b:
-                        st.warning("Target Odoo B me ye code already exist karta hai. Kuch create nahi kiya.")
+                        st.warning(
+                            "Target Odoo B me ye code already exist karta hai. "
+                            "Kuch create nahi kiya."
+                        )
                         st.write(map_b[code])
                     else:
                         # Get from A
@@ -371,9 +384,8 @@ if mode == "🧪 Single test create":
                             price = get_source_price(pa, ta, price_source)
 
                             # 1) Ensure template in B
-                            tmpl_b = None
-                            # simple rule: search by name + category
-                            dom_tmpl = [["name", "=", ta.get("name", "")]]
+                            tmpl_name = ta.get("name", pa.get("name", code))
+                            dom_tmpl = [["name", "=", tmpl_name]]
                             tmpl_search = odoo_search_read(
                                 rpc_b,
                                 db_b,
@@ -386,9 +398,10 @@ if mode == "🧪 Single test create":
                             )
                             if tmpl_search:
                                 tmpl_b_id = tmpl_search[0]["id"]
+                                tmpl_action = "USED_EXISTING_TEMPLATE"
                             else:
                                 vals_tmpl = {
-                                    "name": ta.get("name", pa.get("name", code)),
+                                    "name": tmpl_name,
                                     "categ_id": ta.get("categ_id", [False, False])[0],
                                     "product_brand_id": ta.get("product_brand_id", [False, False])[0],
                                     "list_price": price,
@@ -396,6 +409,7 @@ if mode == "🧪 Single test create":
                                 tmpl_b_id = odoo_create(
                                     rpc_b, db_b, uid_b, key_b, "product.template", vals_tmpl
                                 )
+                                tmpl_action = "CREATED_TEMPLATE"
 
                             # 2) Create variant in B
                             vals_prod = {
@@ -409,12 +423,13 @@ if mode == "🧪 Single test create":
                             )
 
                             st.success(
-                                f"✅ Test create done. Template ID B: {tmpl_b_id}, Product ID B: {new_prod_id}"
+                                f"✅ Test create done. {tmpl_action}, "
+                                f"Template ID B: {tmpl_b_id}, Product ID B: {new_prod_id}"
                             )
                             st.json(
                                 {
                                     "code": code,
-                                    "template_name": ta.get("name"),
+                                    "template_name": tmpl_name,
                                     "price_used": price,
                                     "product_id_b": new_prod_id,
                                 }
@@ -422,7 +437,8 @@ if mode == "🧪 Single test create":
             except Exception as e:
                 st.error(f"❌ Error: {e}")
 
-# -------- Mode 3: FULL AUTO (PDF → BULK) -------- #
+
+# ----------------- MODE 3: FULL AUTO (PDF → BULK) ----------------- #
 if mode == "⚙️ Full auto (PDF → bulk)":
     st.markdown("### ⚙️ Full auto create (use carefully)")
     st.warning(
@@ -445,7 +461,9 @@ if mode == "⚙️ Full auto (PDF → bulk)":
 
                 codes_missing_b = [c for c in codes if c not in map_b]
                 if not codes_missing_b:
-                    st.info("Saare codes already Target B me hain, kuch create nahi karne ko.")
+                    st.info(
+                        "Saare codes already Target B me hain, kuch create nahi karne ko."
+                    )
                 else:
                     st.write(f"Missing in B: {len(codes_missing_b)} codes.")
 
@@ -464,11 +482,8 @@ if mode == "⚙️ Full auto (PDF → bulk)":
                     )
 
                     summary_rows = []
-
-                    # simple cache: template name → tmpl_id in B
                     tmpl_name_to_id_b = {
-                        t["name"]: t_id
-                        for t_id, t in map_tmpl_b.items()
+                        t["name"]: t_id for t_id, t in map_tmpl_b.items()
                     }
 
                     for code in codes_missing_b:
@@ -534,7 +549,8 @@ if mode == "⚙️ Full auto (PDF → bulk)":
             except Exception as e:
                 st.error(f"❌ Error: {e}")
 
-# -------- DOWNLOAD EXCEL (ANY MODE) -------- #
+
+# ----------------- DOWNLOAD EXCEL (ANY MODE) ----------------- #
 final_df = st.session_state.get("result_df")
 if final_df is not None and not final_df.empty:
     def make_excel(df: pd.DataFrame) -> BytesIO:
